@@ -1,5 +1,5 @@
 """
-Efficacy-guided prototype memory for CCEL-Net.
+Dual-guided efficacy prototype memory for CCEL.
 
 For each class c, maintain an EMA prototype m_c in feature space.
 Prototype scores are cosine similarities corrected by prediction prior:
@@ -187,7 +187,8 @@ class PrototypeMemory(nn.Module):
         For an uninitialized class, the first observed class mean directly
         initializes the prototype, independent of omega_c.
 
-        Returns a small update log dictionary.
+        Returns a small update log dictionary. ``prototype_update_strength`` is
+        omega_c in the paper.
         """
         flat_features, flat_target = self._flatten_features_and_target(features, target)
         device = features.device
@@ -197,7 +198,11 @@ class PrototypeMemory(nn.Module):
         lr_used = torch.zeros(self.num_classes, device=device, dtype=dtype)
 
         if flat_features.numel() == 0:
-            return {"updated_mask": updated_mask, "prototype_lr": lr_used}
+            return {
+                "updated_mask": updated_mask,
+                "prototype_lr": lr_used,
+                "prototype_update_strength": torch.zeros(self.num_classes, device=device, dtype=dtype),
+            }
 
         if psi is None:
             update_strength = torch.ones(self.num_classes, device=device, dtype=dtype)
@@ -205,6 +210,7 @@ class PrototypeMemory(nn.Module):
             psi = psi.detach().to(device=device, dtype=dtype).reshape(-1)
             if psi.numel() != self.num_classes:
                 raise ValueError(f"psi must have shape [{self.num_classes}]")
+            # omega_c = 1 - psi_c. Low-efficacy classes receive stronger EMA updates.
             update_strength = (1.0 - psi).clamp(0.0, 1.0)
 
         prototypes = self.prototypes.to(device=device, dtype=dtype)
@@ -241,7 +247,11 @@ class PrototypeMemory(nn.Module):
         else:
             self.prototypes.copy_(prototypes)
 
-        return {"updated_mask": updated_mask, "prototype_lr": lr_used}
+        return {
+            "updated_mask": updated_mask,
+            "prototype_lr": lr_used,
+            "prototype_update_strength": update_strength.detach().clone(),
+        }
 
     # ------------------------------------------------------------------
     # Scoring
@@ -285,6 +295,7 @@ class PrototypeMemory(nn.Module):
         info: Dict[str, Tensor] = {
             "initialized": valid.detach().clone(),
             "class_update_count": self.class_update_count.detach().to(device=sim.device).clone(),
+            "s_hat": sim.detach().clone(),
         }
         if correction is not None:
             info["prior_correction"] = correction.detach().clone()

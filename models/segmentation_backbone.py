@@ -1,461 +1,277 @@
 """
-Segmentation backbones for CCEL-Net.
+Prior branch for Prior-Separable Chance-Corrected Evidence Learning (CCEL).
 
-This file provides a lightweight Mobile-UNETR style segmentation feature
-extractor. It is intentionally written as a backbone, not a full CCEL-Net model:
+This module corresponds to the prior-induced bias term in the paper:
 
-    image -> MobileUNETRBackbone -> feature map [B, feature_dim, H/2, W/2]
+    z_i = b_i + e_i,
+    b_i = g(log pi_global, log pi_batch, log r_bar).
 
-CCELNet will attach its own EvidenceHead / PriorBranch on top of this feature
-map. For ordinary CE baselines, this file also provides a small standalone
-MobileUNETRSegmentationModel with a 1x1 segmentation head.
+It estimates only distribution-level bias logits, not input-dependent visual
+or semantic evidence. The evidence branch is therefore evaluated separately by
+the chance-corrected evidence efficacy constraint.
 
-Recommended placement:
-    ccel/models/segmentation_backbone.py
-
-Example for CCEL-Net:
-    from ccel.models.segmentation_backbone import build_segmentation_backbone
-    from ccel.models.ccel_net import CCELNet
-
-    backbone, feature_dim = build_segmentation_backbone(
-        name="mobile_unetr_xxs",
-        in_channels=3,
-        feature_dim=128,
-    )
-    model = CCELNet(
-        backbone=backbone,
-        feature_dim=feature_dim,
-        num_classes=3,
-        class_prior=train_set.get_class_priors_tensor(),
-        task="segmentation",
-        ignore_index=255,
-    )
+Important implementation details
+--------------------------------
+1. Validation/test must not use target-derived batch prior. This branch only uses
+   batch prior when ``allow_target_prior=True`` and target is provided. In CCEL,
+   the default is allow_target_prior = model.training.
+2. When target is unavailable, batch prior is skipped instead of being replaced by
+   global prior. This avoids counting the same global prior twice.
+3. Multiple prior terms can become too strong under extreme imbalance. Therefore,
+   enabled terms can be weight-normalized and the final prior logits can be scaled
+   and clipped. The returned ``info`` dictionary exposes each prior component for
+   paper-consistent logging and ablation.
 """
-
 from __future__ import annotations
 
-from typing import Dict, Literal, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple
 
 import torch
-from torch import Tensor, nn
-import torch.nn.functional as F
+from torch import nn
+
+Tensor = torch.Tensor
 
 
-# -----------------------------------------------------------------------------
-# Basic layers
-# -----------------------------------------------------------------------------
-
-
-def _make_divisible(v: int, divisor: int = 8) -> int:
-    return int((v + divisor - 1) // divisor * divisor)
-
-
-class ConvBNAct(nn.Module):
-    """Conv2d + BatchNorm2d + activation."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        stride: int = 1,
-        groups: int = 1,
-        act: bool = True,
-    ) -> None:
-        super().__init__()
-        padding = kernel_size // 2
-        self.block = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                groups=groups,
-                bias=False,
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.SiLU(inplace=True) if act else nn.Identity(),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.block(x)
-
-
-class InvertedResidual(nn.Module):
-    """MobileNetV2-style inverted residual block."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        stride: int = 1,
-        expand_ratio: float = 4.0,
-    ) -> None:
-        super().__init__()
-        if stride not in {1, 2}:
-            raise ValueError("stride must be 1 or 2")
-
-        hidden_dim = _make_divisible(int(round(in_channels * expand_ratio)))
-        self.use_res_connect = stride == 1 and in_channels == out_channels
-
-        layers = []
-        if hidden_dim != in_channels:
-            layers.append(ConvBNAct(in_channels, hidden_dim, kernel_size=1))
-        layers.extend(
-            [
-                ConvBNAct(
-                    hidden_dim,
-                    hidden_dim,
-                    kernel_size=3,
-                    stride=stride,
-                    groups=hidden_dim,
-                ),
-                ConvBNAct(hidden_dim, out_channels, kernel_size=1, act=False),
-            ]
-        )
-        self.block = nn.Sequential(*layers)
-
-    def forward(self, x: Tensor) -> Tensor:
-        out = self.block(x)
-        if self.use_res_connect:
-            out = out + x
-        return out
-
-
-class TransformerEncoderBlock(nn.Module):
-    """Small transformer encoder block applied on flattened spatial tokens."""
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 4,
-        mlp_ratio: float = 2.0,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.norm2 = nn.LayerNorm(dim)
-        hidden = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: [B, C, H, W]
-        b, c, h, w = x.shape
-        tokens = x.flatten(2).transpose(1, 2)  # [B, HW, C]
-        attn_in = self.norm1(tokens)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
-        tokens = tokens + attn_out
-        tokens = tokens + self.mlp(self.norm2(tokens))
-        return tokens.transpose(1, 2).reshape(b, c, h, w)
-
-
-class UpFuseBlock(nn.Module):
-    """Upsample decoder feature and fuse with encoder skip feature."""
-
-    def __init__(self, in_channels: int, skip_channels: int, out_channels: int) -> None:
-        super().__init__()
-        self.fuse = nn.Sequential(
-            ConvBNAct(in_channels + skip_channels, out_channels, kernel_size=3),
-            InvertedResidual(out_channels, out_channels, stride=1, expand_ratio=2.0),
-        )
-
-    def forward(self, x: Tensor, skip: Tensor) -> Tensor:
-        if x.shape[-2:] != skip.shape[-2:]:
-            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        return self.fuse(torch.cat([x, skip], dim=1))
-
-
-# -----------------------------------------------------------------------------
-# Mobile-UNETR style backbone
-# -----------------------------------------------------------------------------
-
-
-class MobileUNETRBackbone(nn.Module):
-    """
-    Lightweight Mobile-UNETR style feature extractor for segmentation.
-
-    It combines:
-        1. MobileNet-style inverted residual encoder;
-        2. Transformer blocks at the bottleneck;
-        3. UNet-style skip decoder.
-
-    Output:
-        feature map [B, feature_dim, H/2, W/2].
-
-    The output is deliberately a feature map instead of class logits, because
-    CCELNet attaches EvidenceHead(feature_dim, num_classes, task="segmentation")
-    by itself. If your trainer expects logits directly, use
-    MobileUNETRSegmentationModel below.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 3,
-        feature_dim: int = 128,
-        widths: Tuple[int, int, int, int] = (32, 64, 128, 192),
-        depths: Tuple[int, int, int, int] = (1, 2, 2, 2),
-        transformer_depth: int = 2,
-        num_heads: int = 4,
-        mlp_ratio: float = 2.0,
-        dropout: float = 0.0,
-        expand_ratio: float = 4.0,
-        return_dict: bool = False,
-    ) -> None:
-        super().__init__()
-        c1, c2, c3, c4 = widths
-        d1, d2, d3, d4 = depths
-        self.feature_dim = int(feature_dim)
-        self.out_channels = int(feature_dim)
-        self.return_dict = bool(return_dict)
-
-        self.stem = ConvBNAct(in_channels, c1, kernel_size=3, stride=2)  # H/2
-        self.enc1 = self._make_stage(c1, c1, depth=d1, stride=1, expand_ratio=expand_ratio)
-        self.enc2 = self._make_stage(c1, c2, depth=d2, stride=2, expand_ratio=expand_ratio)  # H/4
-        self.enc3 = self._make_stage(c2, c3, depth=d3, stride=2, expand_ratio=expand_ratio)  # H/8
-        self.enc4 = self._make_stage(c3, c4, depth=d4, stride=2, expand_ratio=expand_ratio)  # H/16
-
-        self.transformer = nn.Sequential(
-            *[
-                TransformerEncoderBlock(
-                    dim=c4,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout,
-                )
-                for _ in range(transformer_depth)
-            ]
-        )
-
-        self.dec3 = UpFuseBlock(c4, c3, c3)  # H/8
-        self.dec2 = UpFuseBlock(c3, c2, c2)  # H/4
-        self.dec1 = UpFuseBlock(c2, c1, feature_dim)  # H/2
-        self.out_proj = nn.Sequential(
-            InvertedResidual(feature_dim, feature_dim, stride=1, expand_ratio=2.0),
-            ConvBNAct(feature_dim, feature_dim, kernel_size=1),
-        )
-
-        self._init_weights()
-
-    @staticmethod
-    def _make_stage(
-        in_channels: int,
-        out_channels: int,
-        depth: int,
-        stride: int,
-        expand_ratio: float,
-    ) -> nn.Sequential:
-        layers = [
-            InvertedResidual(
-                in_channels,
-                out_channels,
-                stride=stride,
-                expand_ratio=expand_ratio,
-            )
-        ]
-        for _ in range(max(0, depth - 1)):
-            layers.append(
-                InvertedResidual(
-                    out_channels,
-                    out_channels,
-                    stride=1,
-                    expand_ratio=expand_ratio,
-                )
-            )
-        return nn.Sequential(*layers)
-
-    def _init_weights(self) -> None:
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward_features(self, x: Tensor) -> Tensor:
-        x1 = self.enc1(self.stem(x))  # H/2
-        x2 = self.enc2(x1)            # H/4
-        x3 = self.enc3(x2)            # H/8
-        x4 = self.enc4(x3)            # H/16
-        x4 = self.transformer(x4)
-
-        d3 = self.dec3(x4, x3)
-        d2 = self.dec2(d3, x2)
-        d1 = self.dec1(d2, x1)
-        feat = self.out_proj(d1)
-        return feat
-
-    def forward(self, x: Tensor) -> Union[Tensor, Dict[str, Tensor]]:
-        feat = self.forward_features(x)
-        if self.return_dict:
-            return {"features": feat}
-        return feat
-
-
-class MobileUNETRSegmentationModel(nn.Module):
-    """Standalone segmentation model for ordinary CE/loss baselines."""
-
+class PriorBranch(nn.Module):
     def __init__(
         self,
         num_classes: int,
-        in_channels: int = 3,
-        feature_dim: int = 128,
-        widths: Tuple[int, int, int, int] = (32, 64, 128, 192),
-        depths: Tuple[int, int, int, int] = (1, 2, 2, 2),
-        transformer_depth: int = 2,
-        num_heads: int = 4,
-        dropout: float = 0.0,
-    ) -> None:
+        class_prior,
+        eps: float = 1e-6,
+        kappa: float = 32.0,
+        beta: float = 0.99,
+        use_global_prior: bool = True,
+        use_batch_prior: bool = True,
+        use_pred_prior_ema: bool = True,
+        global_prior_weight: float = 1.0,
+        batch_prior_weight: float = 1.0,
+        pred_prior_weight: float = 1.0,
+        normalize_prior_weights: bool = True,
+        prior_logit_scale: float = 1.0,
+        max_abs_prior_logit: Optional[float] = 6.0,
+        center_logits: bool = True,
+        ignore_index: Optional[int] = 255,
+    ):
         super().__init__()
-        self.backbone = MobileUNETRBackbone(
-            in_channels=in_channels,
-            feature_dim=feature_dim,
-            widths=widths,
-            depths=depths,
-            transformer_depth=transformer_depth,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
-        self.classifier = nn.Conv2d(feature_dim, num_classes, kernel_size=1)
+        self.num_classes = int(num_classes)
+        self.eps = float(eps)
+        self.kappa = float(kappa)
+        self.beta = float(beta)
+        self.use_global_prior = bool(use_global_prior)
+        self.use_batch_prior = bool(use_batch_prior)
+        self.use_pred_prior_ema = bool(use_pred_prior_ema)
+        self.global_prior_weight = float(global_prior_weight)
+        self.batch_prior_weight = float(batch_prior_weight)
+        self.pred_prior_weight = float(pred_prior_weight)
+        self.normalize_prior_weights = bool(normalize_prior_weights)
+        self.prior_logit_scale = float(prior_logit_scale)
+        self.max_abs_prior_logit = max_abs_prior_logit
+        self.center_logits = bool(center_logits)
+        self.ignore_index = ignore_index
 
-    def forward(self, x: Tensor) -> Tensor:
-        input_size = x.shape[-2:]
-        feat = self.backbone(x)
-        logits = self.classifier(feat)
-        if logits.shape[-2:] != input_size:
-            logits = F.interpolate(logits, size=input_size, mode="bilinear", align_corners=False)
-        return logits
+        prior = torch.as_tensor(class_prior, dtype=torch.float32).reshape(-1)
+        if prior.numel() != self.num_classes:
+            raise ValueError(f"class_prior must have {self.num_classes} elements")
+        prior = prior.clamp_min(self.eps)
+        prior = prior / prior.sum().clamp_min(self.eps)
 
+        self.register_buffer("global_prior", prior.clone())
+        self.register_buffer("pred_prior_ema", prior.clone())
 
-# -----------------------------------------------------------------------------
-# Builders
-# -----------------------------------------------------------------------------
+    @torch.no_grad()
+    def _target_counts(self, target: Tensor) -> Tensor:
+        """Count valid labels in target, ignoring ignore_index and invalid labels."""
+        flat = target.reshape(-1).long()
+        if self.ignore_index is not None:
+            flat = flat[flat != int(self.ignore_index)]
+        flat = flat[(flat >= 0) & (flat < self.num_classes)]
+        if flat.numel() == 0:
+            return torch.zeros(self.num_classes, device=target.device, dtype=torch.float32)
+        return torch.bincount(flat, minlength=self.num_classes).to(device=target.device, dtype=torch.float32)
 
+    @torch.no_grad()
+    def batch_prior(self, target: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Compute shrunk batch prior.
 
-_PRESETS = {
-    # Safer first choice for 128x128 patches / small GPU.
-    "mobile_unetr_xxs": {
-        "widths": (24, 48, 96, 160),
-        "depths": (1, 1, 2, 2),
-        "feature_dim": 96,
-        "transformer_depth": 1,
-        "num_heads": 4,
-    },
-    "mobile_unetr_xs": {
-        "widths": (32, 64, 128, 192),
-        "depths": (1, 2, 2, 2),
-        "feature_dim": 128,
-        "transformer_depth": 2,
-        "num_heads": 4,
-    },
-    "mobile_unetr_s": {
-        "widths": (40, 80, 160, 240),
-        "depths": (1, 2, 3, 2),
-        "feature_dim": 160,
-        "transformer_depth": 2,
-        "num_heads": 4,
-    },
-}
+        pi_tilde_c = (1 - alpha_c) * pi_global_c + alpha_c * pi_batch_c
+        alpha_c    = n_c / (n_c + kappa)
 
+        Returns:
+            pi_tilde: [C]
+            pi_batch: [C]
+            counts:   [C]
+        """
+        counts = self._target_counts(target)
+        total = counts.sum().clamp_min(1.0)
+        pi_batch = counts / total
+        alpha = counts / (counts + self.kappa)
 
-def build_segmentation_backbone(
-    name: str = "mobile_unetr_xxs",
-    *,
-    in_channels: int = 3,
-    feature_dim: Optional[int] = None,
-    return_dict: bool = False,
-    **kwargs,
-) -> Tuple[nn.Module, int]:
-    """
-    Build a segmentation backbone for CCELNet.
+        global_prior = self.global_prior.to(device=target.device, dtype=torch.float32)
+        pi_tilde = (1.0 - alpha) * global_prior + alpha * pi_batch
+        pi_tilde = pi_tilde.clamp_min(self.eps)
+        pi_tilde = pi_tilde / pi_tilde.sum().clamp_min(self.eps)
+        return pi_tilde, pi_batch, counts
 
-    Returns:
-        backbone, feature_dim
+    @torch.no_grad()
+    def update_pred_prior(self, probs: Tensor) -> Tensor:
+        """Update EMA of model prediction prior using final probabilities."""
+        if probs.dim() == 2:
+            r = probs.detach().mean(dim=0)
+        elif probs.dim() == 4:
+            r = probs.detach().mean(dim=(0, 2, 3))
+        else:
+            raise ValueError(f"probs must be [B,C] or [B,C,H,W], got {tuple(probs.shape)}")
 
-    Supported names:
-        - mobile_unetr
-        - mobileunetr
-        - mobile_unetr_xxs
-        - mobile_unetr_xs
-        - mobile_unetr_s
-    """
-    key = name.lower().replace("-", "_")
-    if key in {"mobileunetr", "mobile_unetr"}:
-        key = "mobile_unetr_xxs"
-    if key not in _PRESETS:
-        raise ValueError(f"Unknown segmentation backbone: {name}. Available: {list(_PRESETS)}")
+        r = r.to(device=self.pred_prior_ema.device, dtype=self.pred_prior_ema.dtype)
+        r = r.clamp_min(self.eps)
+        r = r / r.sum().clamp_min(self.eps)
+        self.pred_prior_ema.mul_(self.beta).add_(r, alpha=1.0 - self.beta)
+        self.pred_prior_ema.div_(self.pred_prior_ema.sum().clamp_min(self.eps))
+        return self.pred_prior_ema
 
-    cfg = dict(_PRESETS[key])
-    cfg.update(kwargs)
-    if feature_dim is not None:
-        cfg["feature_dim"] = int(feature_dim)
+    def _broadcast(self, prior_logits: Tensor, logits_shape: Tuple[int, ...]) -> Tensor:
+        if len(logits_shape) == 2:
+            bsz, c = logits_shape
+            return prior_logits.view(1, c).expand(bsz, c)
+        if len(logits_shape) == 4:
+            bsz, c, h, w = logits_shape
+            return prior_logits.view(1, c, 1, 1).expand(bsz, c, h, w)
+        raise ValueError(f"logits_shape must be [B,C] or [B,C,H,W], got {logits_shape}")
 
-    backbone = MobileUNETRBackbone(
-        in_channels=in_channels,
-        feature_dim=int(cfg["feature_dim"]),
-        widths=tuple(cfg["widths"]),
-        depths=tuple(cfg["depths"]),
-        transformer_depth=int(cfg["transformer_depth"]),
-        num_heads=int(cfg["num_heads"]),
-        dropout=float(cfg.get("dropout", 0.0)),
-        return_dict=return_dict,
-    )
-    return backbone, int(cfg["feature_dim"])
+    def _add_prior_term(self, terms, weights, names, prior: Tensor, weight: float, name: str) -> None:
+        if weight == 0.0:
+            return
+        terms.append(torch.log(prior.clamp_min(self.eps)))
+        weights.append(float(weight))
+        names.append(str(name))
 
+    def forward(
+        self,
+        logits_shape: Tuple[int, ...],
+        target: Optional[Tensor] = None,
+        *,
+        allow_target_prior: bool = False,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tuple[Tensor, Dict[str, Tensor]]:
+        """
+        Args:
+            logits_shape:
+                Shape of evidence logits, [B,C] or [B,C,H,W].
+            target:
+                Ground truth labels. Only used when allow_target_prior=True.
+            allow_target_prior:
+                Whether target-derived batch prior is allowed. Set False during
+                validation/test to avoid label leakage.
+            device, dtype:
+                Output device/dtype. Usually evidence_logits.device/dtype.
+        """
+        device = device or self.global_prior.device
+        dtype = dtype or self.global_prior.dtype
 
-def build_segmentation_model(
-    name: str = "mobile_unetr_xxs",
-    *,
-    num_classes: int,
-    in_channels: int = 3,
-    feature_dim: Optional[int] = None,
-    **kwargs,
-) -> nn.Module:
-    """Build a standalone segmentation model for CE / baseline losses."""
-    key = name.lower().replace("-", "_")
-    if key in {"mobileunetr", "mobile_unetr"}:
-        key = "mobile_unetr_xxs"
-    if key not in _PRESETS:
-        raise ValueError(f"Unknown segmentation model: {name}. Available: {list(_PRESETS)}")
+        global_prior = self.global_prior.to(device=device, dtype=dtype).clamp_min(self.eps)
+        global_prior = global_prior / global_prior.sum().clamp_min(self.eps)
+        pred_prior = self.pred_prior_ema.to(device=device, dtype=dtype).clamp_min(self.eps)
+        pred_prior = pred_prior / pred_prior.sum().clamp_min(self.eps)
 
-    cfg = dict(_PRESETS[key])
-    cfg.update(kwargs)
-    if feature_dim is not None:
-        cfg["feature_dim"] = int(feature_dim)
+        batch_prior_available = bool(target is not None and allow_target_prior and self.use_batch_prior)
+        pi_batch_raw = torch.empty(0, device=device, dtype=dtype)
+        batch_counts = torch.empty(0, device=device, dtype=dtype)
 
-    return MobileUNETRSegmentationModel(
-        num_classes=num_classes,
-        in_channels=in_channels,
-        feature_dim=int(cfg["feature_dim"]),
-        widths=tuple(cfg["widths"]),
-        depths=tuple(cfg["depths"]),
-        transformer_depth=int(cfg["transformer_depth"]),
-        num_heads=int(cfg["num_heads"]),
-        dropout=float(cfg.get("dropout", 0.0)),
-    )
+        terms = []
+        weights = []
+        names = []
 
+        log_global_prior = torch.log(global_prior.clamp_min(self.eps))
+        log_pred_prior = torch.log(pred_prior.clamp_min(self.eps))
+        log_batch_prior = torch.empty(0, device=device, dtype=dtype)
 
-__all__ = [
-    "MobileUNETRBackbone",
-    "MobileUNETRSegmentationModel",
-    "build_segmentation_backbone",
-    "build_segmentation_model",
-]
+        if self.use_global_prior:
+            self._add_prior_term(terms, weights, names, global_prior, self.global_prior_weight, "global")
+
+        if batch_prior_available:
+            batch_prior, pi_batch_raw, batch_counts = self.batch_prior(target)
+            batch_prior = batch_prior.to(device=device, dtype=dtype)
+            pi_batch_raw = pi_batch_raw.to(device=device, dtype=dtype)
+            batch_counts = batch_counts.to(device=device, dtype=dtype)
+            log_batch_prior = torch.log(batch_prior.clamp_min(self.eps))
+            self._add_prior_term(terms, weights, names, batch_prior, self.batch_prior_weight, "batch")
+        else:
+            batch_prior = torch.empty(0, device=device, dtype=dtype)
+
+        if self.use_pred_prior_ema:
+            self._add_prior_term(terms, weights, names, pred_prior, self.pred_prior_weight, "pred")
+
+        if not terms:
+            prior_logits = torch.zeros(self.num_classes, device=device, dtype=dtype)
+            effective_weight_sum = torch.tensor(0.0, device=device, dtype=dtype)
+        else:
+            weight_tensor = torch.tensor(weights, device=device, dtype=dtype)
+            stacked = torch.stack(terms, dim=0)
+            if self.normalize_prior_weights:
+                denom = weight_tensor.abs().sum().clamp_min(self.eps)
+                prior_logits = (stacked * weight_tensor.view(-1, 1)).sum(dim=0) / denom
+                effective_weight_sum = denom.detach()
+            else:
+                prior_logits = (stacked * weight_tensor.view(-1, 1)).sum(dim=0)
+                effective_weight_sum = weight_tensor.abs().sum().detach()
+
+        raw_prior_logits = prior_logits
+
+        if self.center_logits:
+            prior_logits = prior_logits - prior_logits.mean()
+
+        scaled_prior_logits = prior_logits * self.prior_logit_scale
+        prior_logits = scaled_prior_logits
+
+        if self.max_abs_prior_logit is not None:
+            prior_logits = prior_logits.clamp(
+                min=-float(self.max_abs_prior_logit),
+                max=float(self.max_abs_prior_logit),
+            )
+
+        broadcast_prior_logits = self._broadcast(prior_logits, logits_shape)
+
+        # chance_prior_for_loss is the best available training baseline. During
+        # eval/test with no target prior, it falls back to global prior and does
+        # not leak labels.
+        if batch_prior_available:
+            chance_prior_for_loss = batch_prior.detach()
+        else:
+            chance_prior_for_loss = global_prior.detach()
+
+        info: Dict[str, Tensor] = {
+            # Priors in paper notation.
+            "global_prior": global_prior.detach(),
+            "pi_global": global_prior.detach(),
+            "pred_prior_ema": pred_prior.detach(),
+            "r_bar": pred_prior.detach(),
+            "chance_prior_for_loss": chance_prior_for_loss,
+            "pi_tilde": chance_prior_for_loss,
+
+            # Bias logits b_i and component logs before broadcasting.
+            "prior_logits_vector": prior_logits.detach(),
+            "b_vector": prior_logits.detach(),
+            "raw_prior_logits_vector": raw_prior_logits.detach(),
+            "scaled_prior_logits_vector": scaled_prior_logits.detach(),
+            "log_global_prior": log_global_prior.detach(),
+            "log_pred_prior": log_pred_prior.detach(),
+            "log_batch_prior": log_batch_prior.detach(),
+
+            # Diagnostics for ablation and reproducibility.
+            "batch_prior_available": torch.tensor(batch_prior_available, device=device),
+            "effective_prior_weight_sum": effective_weight_sum,
+            "enabled_prior_terms": torch.tensor(len(terms), device=device, dtype=dtype),
+        }
+        if batch_prior_available:
+            info.update(
+                {
+                    "batch_prior": batch_prior.detach(),
+                    "pi_batch_tilde": batch_prior.detach(),
+                    "batch_prior_raw": pi_batch_raw.detach(),
+                    "pi_batch_raw": pi_batch_raw.detach(),
+                    "batch_counts": batch_counts.detach(),
+                }
+            )
+        return broadcast_prior_logits, info

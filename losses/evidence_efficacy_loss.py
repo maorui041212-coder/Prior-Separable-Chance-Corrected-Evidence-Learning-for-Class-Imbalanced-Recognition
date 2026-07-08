@@ -149,6 +149,8 @@ class EvidenceEfficacyConstraint(nn.Module):
         target: Tensor,
         *,
         chance_prior: Optional[Tensor] = None,
+        rho_override: Optional[Tensor] = None,
+        map_rho_override: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         """
         Return class-wise and optional map-wise constraint violations.
@@ -173,29 +175,18 @@ class EvidenceEfficacyConstraint(nn.Module):
 
         class_psi_raw = _extract_class_psi(eff)
         class_psi_clamped = _extract_clamped_class_psi(eff, class_psi_raw)
-
-        # Numerical guard:
-        # In extremely imbalanced segmentation, some rare-class mini-batches can
-        # produce NaN/Inf efficacy values. Never allow them to enter constraint
-        # violation or dual-variable update.
-        class_psi_raw = torch.nan_to_num(
-            class_psi_raw,
-            nan=-1.0,
-            posinf=1.0,
-            neginf=-1.0,
-        )
-        class_psi_clamped = torch.nan_to_num(
-            class_psi_clamped,
-            nan=-1.0,
-            posinf=1.0,
-            neginf=-1.0,
-        )
-
         class_psi_for_violation = (
             class_psi_clamped if self.use_clamped_psi_for_violation else class_psi_raw
         )
 
-        rho = self.rho.to(device=class_psi_raw.device, dtype=class_psi_raw.dtype)
+        if rho_override is None:
+            rho = self.rho.to(device=class_psi_raw.device, dtype=class_psi_raw.dtype)
+        else:
+            rho = torch.as_tensor(rho_override, device=class_psi_raw.device, dtype=class_psi_raw.dtype).reshape(-1)
+            if rho.numel() == 1:
+                rho = rho.repeat(self.num_classes)
+            if rho.numel() != self.num_classes:
+                raise ValueError(f"rho_override must be scalar or have num_classes={self.num_classes} values")
         class_mask = self.class_mask.to(device=class_psi_raw.device, dtype=class_psi_raw.dtype)
 
         class_violation_raw = F.relu(rho - class_psi_for_violation)
@@ -232,12 +223,6 @@ class EvidenceEfficacyConstraint(nn.Module):
                     "to return 'map_psi'. Update ccel.metrics.efficacy_metrics first."
                 )
             map_psi_raw = eff["map_psi"]
-            map_psi_raw = torch.nan_to_num(
-                map_psi_raw,
-                nan=-1.0,
-                posinf=1.0,
-                neginf=-1.0,
-            )
             if not torch.is_tensor(map_psi_raw):
                 map_psi_raw = torch.as_tensor(
                     map_psi_raw, device=class_psi_raw.device, dtype=class_psi_raw.dtype
@@ -248,7 +233,14 @@ class EvidenceEfficacyConstraint(nn.Module):
             map_psi_for_violation = (
                 map_psi_clamped if self.use_clamped_psi_for_violation else map_psi_raw
             )
-            map_rho = self.map_rho.to(device=class_psi_raw.device, dtype=class_psi_raw.dtype)
+            if map_rho_override is None:
+                map_rho = self.map_rho.to(device=class_psi_raw.device, dtype=class_psi_raw.dtype)
+            else:
+                map_rho = torch.as_tensor(
+                    map_rho_override,
+                    device=class_psi_raw.device,
+                    dtype=class_psi_raw.dtype,
+                ).reshape(())
             map_violation = F.relu(map_rho - map_psi_for_violation)
             out.update(
                 {

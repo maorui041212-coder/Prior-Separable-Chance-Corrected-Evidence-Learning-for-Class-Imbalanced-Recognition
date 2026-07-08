@@ -1,14 +1,18 @@
-"""Primal-dual efficacy objective for CCEL-Net.
+"""Primal-dual efficacy objective for CCEL.
 
 This file owns the final training objective and dual-variable updates:
 
-    L = CE(b + e, y) + sum_c mu_c * [rho_c - psi_c]_+
-        + mu_map * [rho_map - psi_map]_+
+    L_CCEL = CE(z, y) + sum_c mu_c [rho_c - psi_c^e]_+
 
-It must NOT reimplement soft confusion matrix or chance-corrected efficacy.
-Those formulas live in ``ccel.metrics.efficacy_metrics``. It must also NOT
-recompute violation logic directly; violation construction lives in
-``ccel.losses.evidence_efficacy_loss``.
+It also supports the paper-style learnable efficacy threshold:
+
+    tau = tau_min + (tau_max - tau_min) * sigmoid(a_tau)
+    L_CCEL = CE(z, y) - lambda_tau * tau + sum_c mu_c [tau - psi_c^e]_+
+
+When ``learnable_tau=False`` the old fixed-rho objective is preserved. The soft
+confusion and chance-corrected efficacy formulas remain in
+``ccel.metrics.efficacy_metrics``; this file only assembles the objective and
+performs projected dual ascent.
 """
 from __future__ import annotations
 
@@ -21,6 +25,11 @@ import torch.nn.functional as F
 from ccel.losses.evidence_efficacy_loss import EvidenceEfficacyConstraint
 
 Tensor = torch.Tensor
+
+
+def _inverse_sigmoid(x: float) -> float:
+    x = float(min(max(x, 1e-6), 1.0 - 1e-6))
+    return float(torch.logit(torch.tensor(x)).item())
 
 
 class PrimalDualEfficacyLoss(nn.Module):
@@ -49,6 +58,11 @@ class PrimalDualEfficacyLoss(nn.Module):
         use_clamped_psi_for_violation: bool = True,
         auto_update_mu: bool = True,
         update_mu_on_eval: bool = False,
+        learnable_tau: bool = False,
+        tau_init: Optional[float] = None,
+        tau_min: float = 0.0,
+        tau_max: float = 1.0,
+        tau_reward_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.num_classes = int(num_classes)
@@ -60,6 +74,12 @@ class PrimalDualEfficacyLoss(nn.Module):
         self.use_map_constraint = bool(use_map_constraint)
         self.eta_mu_map = float(eta_mu if eta_mu_map is None else eta_mu_map)
         self.mu_map_max = float(mu_max if mu_map_max is None else mu_map_max)
+        self.learnable_tau = bool(learnable_tau)
+        self.tau_min = float(tau_min)
+        self.tau_max = float(tau_max)
+        if self.tau_max <= self.tau_min:
+            raise ValueError("tau_max must be larger than tau_min")
+        self.tau_reward_weight = float(tau_reward_weight)
 
         self.constraint = EvidenceEfficacyConstraint(
             num_classes=num_classes,
@@ -77,6 +97,18 @@ class PrimalDualEfficacyLoss(nn.Module):
         self.register_buffer("mu", torch.zeros(num_classes, dtype=torch.float32))
         self.register_buffer("mu_map", torch.zeros((), dtype=torch.float32))
 
+        if self.learnable_tau:
+            if tau_init is None:
+                rho_tensor = torch.as_tensor(rho, dtype=torch.float32).reshape(-1)
+                tau_init_value = float(rho_tensor.mean().item())
+            else:
+                tau_init_value = float(tau_init)
+            tau_init_value = min(max(tau_init_value, self.tau_min + 1e-6), self.tau_max - 1e-6)
+            normalized = (tau_init_value - self.tau_min) / (self.tau_max - self.tau_min)
+            self.a_tau = nn.Parameter(torch.tensor(_inverse_sigmoid(normalized), dtype=torch.float32))
+        else:
+            self.register_parameter("a_tau", None)
+
         if ce_weight is not None:
             ce_weight = torch.as_tensor(ce_weight, dtype=torch.float32).reshape(-1)
             if ce_weight.numel() != num_classes:
@@ -84,6 +116,21 @@ class PrimalDualEfficacyLoss(nn.Module):
             self.register_buffer("ce_weight", ce_weight)
         else:
             self.ce_weight = None
+
+    def current_tau(self, *, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> Optional[Tensor]:
+        """Return the learnable efficacy threshold tau, or None for fixed-rho mode."""
+        if self.a_tau is None:
+            return None
+        tau = self.tau_min + (self.tau_max - self.tau_min) * torch.sigmoid(self.a_tau)
+        if device is not None or dtype is not None:
+            tau = tau.to(device=device or tau.device, dtype=dtype or tau.dtype)
+        return tau
+
+    def _rho_for_forward(self, *, device: torch.device, dtype: torch.dtype) -> Optional[Tensor]:
+        tau = self.current_tau(device=device, dtype=dtype)
+        if tau is None:
+            return None
+        return tau.repeat(self.num_classes)
 
     def forward(
         self,
@@ -119,28 +166,27 @@ class PrimalDualEfficacyLoss(nn.Module):
         evidence_logits = outputs["evidence_logits"]
 
         ce = F.cross_entropy(
-            logits.float(),
+            logits,
             target.long(),
             weight=self.ce_weight,
             ignore_index=self.ignore_index if self.ignore_index is not None else -100,
         )
 
+        rho_override = self._rho_for_forward(device=evidence_logits.device, dtype=evidence_logits.dtype)
+        map_rho_override = self.current_tau(device=evidence_logits.device, dtype=evidence_logits.dtype) if self.use_map_constraint else None
+
         constraint_out = self.constraint(
-            evidence_logits.float(),
+            evidence_logits,
             target,
             chance_prior=chance_prior,
+            rho_override=rho_override,
+            map_rho_override=map_rho_override,
         )
 
         mu_before = self.mu.to(device=logits.device, dtype=logits.dtype).clone()
         mu_map_before = self.mu_map.to(device=logits.device, dtype=logits.dtype).clone()
         class_mask = constraint_out["class_mask"].to(device=logits.device, dtype=logits.dtype)
         class_violation = constraint_out["class_violation"].to(device=logits.device, dtype=logits.dtype)
-        class_violation = torch.nan_to_num(
-            class_violation,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
         denom = class_mask.sum().clamp_min(1.0)
 
         if use_constraint:
@@ -155,7 +201,13 @@ class PrimalDualEfficacyLoss(nn.Module):
             class_constraint = torch.zeros((), device=logits.device, dtype=logits.dtype)
             map_constraint = torch.zeros((), device=logits.device, dtype=logits.dtype)
 
-        total = ce + class_constraint + map_constraint
+        tau = self.current_tau(device=logits.device, dtype=logits.dtype)
+        if tau is not None and use_constraint:
+            tau_reward = -float(self.tau_reward_weight) * tau
+        else:
+            tau_reward = torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        total = ce + class_constraint + map_constraint + tau_reward
 
         should_update = self.auto_update_mu if auto_update_mu is None else bool(auto_update_mu)
         should_update = bool(should_update and use_constraint and (self.training or self.update_mu_on_eval))
@@ -194,6 +246,9 @@ class PrimalDualEfficacyLoss(nn.Module):
             "constraint_loss": (class_constraint + map_constraint).detach(),
             "class_constraint_loss": class_constraint.detach(),
             "map_constraint_loss": map_constraint.detach(),
+            "tau_reward_loss": tau_reward.detach(),
+            "tau": (tau.detach() if tau is not None else torch.empty(0, device=logits.device, dtype=logits.dtype)),
+            "rho": constraint_out["rho"].detach(),
             "constraint": constraint_out,
             "psi": constraint_out["class_psi"],
             "class_psi": constraint_out["class_psi"],
@@ -221,16 +276,14 @@ class PrimalDualEfficacyLoss(nn.Module):
             mu_map <- clip(mu_map + eta_mu_map * (rho_map - psi_map), 0, mu_map_max)
         """
         psi = dual_class_psi.detach().to(device=self.mu.device, dtype=self.mu.dtype).reshape(-1)
-        psi = torch.nan_to_num(
-            psi,
-            nan=-1.0,
-            posinf=1.0,
-            neginf=-1.0,
-        )
         if psi.numel() != self.num_classes:
             raise ValueError(f"dual_class_psi must have shape [{self.num_classes}]")
 
-        rho = self.constraint.rho.to(device=self.mu.device, dtype=self.mu.dtype)
+        tau = self.current_tau(device=self.mu.device, dtype=self.mu.dtype)
+        if tau is None:
+            rho = self.constraint.rho.to(device=self.mu.device, dtype=self.mu.dtype)
+        else:
+            rho = tau.detach().repeat(self.num_classes)
         class_mask = self.constraint.class_mask.to(device=self.mu.device, dtype=self.mu.dtype)
         if dual_update_mask is None:
             update_mask = class_mask
@@ -242,32 +295,24 @@ class PrimalDualEfficacyLoss(nn.Module):
 
         self.mu.add_(self.eta_mu * (rho - psi) * update_mask)
         self.mu.clamp_(min=0.0, max=self.mu_max)
-        self.mu.nan_to_num_(
-            nan=0.0,
-            posinf=float(self.mu_max),
-            neginf=0.0,
-        )
 
         if self.use_map_constraint:
             if dual_map_psi is None:
                 raise ValueError("dual_map_psi must be provided when use_map_constraint=True")
             map_psi = dual_map_psi.detach().to(device=self.mu_map.device, dtype=self.mu_map.dtype)
-            map_psi = torch.nan_to_num(
-                map_psi,
-                nan=-1.0,
-                posinf=1.0,
-                neginf=-1.0,
-            )
-            map_rho = self.constraint.map_rho.to(device=self.mu_map.device, dtype=self.mu_map.dtype)
+            tau = self.current_tau(device=self.mu_map.device, dtype=self.mu_map.dtype)
+            if tau is None:
+                map_rho = self.constraint.map_rho.to(device=self.mu_map.device, dtype=self.mu_map.dtype)
+            else:
+                map_rho = tau.detach()
             self.mu_map.add_(self.eta_mu_map * (map_rho - map_psi))
             self.mu_map.clamp_(min=0.0, max=self.mu_map_max)
-            self.mu_map.nan_to_num_(
-                nan=0.0,
-                posinf=float(self.mu_map_max),
-                neginf=0.0,
-            )
 
     @torch.no_grad()
     def reset_dual(self) -> None:
         self.mu.zero_()
         self.mu_map.zero_()
+
+
+# Paper-facing alias. Existing code can keep using PrimalDualEfficacyLoss.
+CCELPrimalDualLoss = PrimalDualEfficacyLoss

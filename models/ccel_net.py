@@ -1,23 +1,29 @@
 """
-CCEL-Net wrapper.
+Prior-Separable Chance-Corrected Evidence Learning (CCEL) wrapper.
 
-It does not define a new backbone from scratch. Instead, it wraps an existing
-classification or segmentation feature extractor and replaces the normal final
-prediction head with:
-    evidence logits e
-    optional prototype evidence scores s_hat
-    prior logits b
-    final logits z = b + e
+This module implements the model-side part of the paper. It does not define a
+new backbone from scratch. Instead, it wraps an existing classification or
+segmentation feature extractor and replaces the ordinary prediction head with
+three paper-level components:
+
+    h_i = F_theta(x_i)                         # shared representation
+    b_i = PriorBranch(...)                     # prior-induced bias logits
+    e_i^lin = EvidenceHead(h_i)                # input-dependent evidence logits
+    s_hat_i = PrototypeMemory(h_i, r_bar)      # chance-corrected prototype evidence
+    e_i = e_i^lin + eta * s_hat_i              # final evidence logits
+    z_i = b_i + e_i                            # posterior/final logits
 
 Important safeguards
 --------------------
 1. Validation/test never uses target-derived batch prior by default.
-2. Warm-up can be true ordinary CE by calling
+2. Stage-1 warm-up can be true ordinary CE by calling
        forward(..., use_prior=False, use_prototype=False)
-   so logits = evidence_logits_linear, not b + e and not e + prototype.
+   so z_i = e_i^lin, not b_i + e_i and not e_i^lin + prototype.
 3. Segmentation logits can be resized either to target spatial size or to an
    explicit output_size, which is useful for target-free inference.
 4. Learnable prototype_eta is constrained to be non-negative by softplus.
+5. The returned dictionary keeps old keys such as ``logits`` while also exposing
+   paper-notation aliases: ``z_logits``, ``b_logits``, ``e_logits``, ``s_hat``.
 """
 from __future__ import annotations
 
@@ -57,6 +63,7 @@ class CCELNet(nn.Module):
         prototype_eta: float = 0.1,
         learnable_eta: bool = True,
         max_prototype_eta: Optional[float] = 5.0,
+        prototype_max_abs_correction: Optional[float] = 1.0,
         ignore_index: Optional[int] = 255,
         prior_kwargs: Optional[Dict[str, Any]] = None,
         resize_logits_to_target: bool = True,
@@ -88,6 +95,7 @@ class CCELNet(nn.Module):
                 feature_dim=feature_dim,
                 momentum=prototype_momentum,
                 lambda_p=prototype_lambda_p,
+                max_abs_correction=prototype_max_abs_correction,
                 ignore_index=ignore_index,
             )
             if learnable_eta:
@@ -218,8 +226,9 @@ class CCELNet(nn.Module):
         features = self._extract_features(x)
         resolved_output_size = self._resolve_output_size(target=target, output_size=output_size)
 
-        # Linear/convolutional evidence head. This is the pure evidence branch
-        # used for strict warm-up when use_prior=False and use_prototype=False.
+        # Linear/convolutional evidence head. This is e_i^lin = W_e h_i.
+        # It is the pure evidence branch used for strict CE warm-up when
+        # use_prior=False and use_prototype=False.
         evidence_logits_linear = self.evidence_head(
             features,
             output_size=resolved_output_size,
@@ -278,11 +287,18 @@ class CCELNet(nn.Module):
         evidence_prob_linear = F.softmax(evidence_logits_linear, dim=1)
 
         if self.training and update_pred_prior and self.use_prior_branch:
-            # Warm-up with use_prior=False/use_prototype=False updates EMA from
-            # pure evidence predictions. Decoupled stages update from final logits.
+            # r_bar is the prediction-prior EMA used by the prior branch and the
+            # chance-corrected prototype score. In warm-up, logits == e_i^lin;
+            # in decoupled stages, logits == z_i = b_i + e_i.
             self.prior_branch.update_pred_prior(prob.detach())
 
+        chance_prior_for_loss = prior_info.get(
+            "chance_prior_for_loss",
+            self.prior_branch.global_prior.detach().to(logits.device),
+        )
+
         return {
+            # Backward-compatible keys used by existing trainers.
             "logits": logits,
             "prob": prob,
             "evidence_logits": evidence_logits,
@@ -296,6 +312,20 @@ class CCELNet(nn.Module):
             "used_prototype": torch.tensor(use_prototype, device=logits.device),
             "features": features,
             "prior_info": prior_info,
+            "chance_prior_for_loss": chance_prior_for_loss,
+
+            # Paper-notation aliases. These make logs/tables consistent with the
+            # manuscript without breaking old code.
+            "z_logits": logits,                 # z_i = b_i + e_i
+            "p": prob,                          # p_theta(y|x_i)
+            "b_logits": prior_logits,           # b_i
+            "e_logits": evidence_logits,        # e_i = e_i^lin + eta*s_hat_i
+            "e_linear_logits": evidence_logits_linear,
+            "p_e": evidence_prob,
+            "p_e_linear": evidence_prob_linear,
+            "s_hat": proto_scores,
+            "h": features,
+            "r_bar": self.prior_branch.pred_prior_ema.detach().to(logits.device),
         }
 
     @torch.no_grad()
@@ -304,12 +334,26 @@ class CCELNet(nn.Module):
         features: Tensor,
         target: Tensor,
         psi: Optional[Tensor] = None,
-    ) -> None:
+    ) -> Dict[str, Tensor]:
         """
-        Update prototype memory. This is intentionally not called inside forward,
-        because prototype updates are non-gradient state updates and should be
-        controlled by the trainer after optimizer.step().
+        Update the efficacy-guided prototype memory after optimizer.step().
+
+        The update is intentionally not called inside ``forward`` because the
+        prototype memory is a non-gradient EMA state. ``psi`` should be the
+        class-wise evidence efficacy used in the paper, so that classes with a
+        larger efficacy gap receive stronger prototype updates.
         """
         if self.use_prototype_memory and self.prototype_memory is not None:
             proto_target = self._resize_target_to_features(target, features)
-            self.prototype_memory.update(features=features, target=proto_target, psi=psi)
+            return self.prototype_memory.update(features=features, target=proto_target, psi=psi)
+
+        device = features.device
+        return {
+            "updated_mask": torch.zeros(self.num_classes, device=device, dtype=torch.bool),
+            "prototype_lr": torch.zeros(self.num_classes, device=device, dtype=features.dtype),
+            "prototype_update_strength": torch.zeros(self.num_classes, device=device, dtype=features.dtype),
+        }
+
+
+# Paper-facing alias. Existing code can keep using CCELNet.
+CCEL = CCELNet
